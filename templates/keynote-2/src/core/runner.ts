@@ -1,9 +1,13 @@
 import hdr from 'hdr-histogram-js';
 import { performance } from 'node:perf_hooks';
+import os from 'node:os';
+import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
 import { pickTwoDistinct, zipfSampler } from './zipf.ts';
 import { getSpacetimeCommittedTransfers } from './spacetimeMetrics.ts';
 import { makeCollisionTracker } from './collision_tracker.ts';
 import { RunResult } from './types.ts';
+import type { WorkerInput, WorkerResult } from './runner_worker.ts';
 
 const OP_TIMEOUT_MS = Number(process.env.BENCH_OP_TIMEOUT_MS ?? '15000');
 const MIN_OP_TIMEOUT_MS = Number(process.env.MIN_OP_TIMEOUT_MS ?? '250');
@@ -441,5 +445,203 @@ export async function runOne({
     collision_ops: c.total,
     collision_count: c.collisions,
     collision_rate: c.collisionRate,
+  };
+}
+
+/**
+ * Precompute Zipf pairs into SharedArrayBuffer-backed Uint32Arrays
+ * so worker threads can read them zero-copy.
+ */
+function precomputeZipfTransferPairsShared(
+  accounts: number,
+  alpha: number,
+  count: number,
+): { from: Uint32Array; to: Uint32Array; fromBuffer: SharedArrayBuffer; toBuffer: SharedArrayBuffer; count: number } {
+  const pick = zipfSampler(accounts, alpha);
+  const fromBuffer = new SharedArrayBuffer(count * 4);
+  const toBuffer = new SharedArrayBuffer(count * 4);
+  const from = new Uint32Array(fromBuffer);
+  const to = new Uint32Array(toBuffer);
+
+  for (let i = 0; i < count; i++) {
+    const [a, b] = pickTwoDistinct(pick);
+    from[i] = a;
+    to[i] = b;
+  }
+
+  return { from, to, fromBuffer, toBuffer, count };
+}
+
+/**
+ * Multi-threaded benchmark runner using worker_threads.
+ * Each thread gets its own event loop, HTTP connections, and histogram.
+ * Eliminates the single-event-loop bottleneck for Node.js clients.
+ */
+export async function runOneMultiThreaded({
+  connectorSystem,
+  seconds,
+  concurrency,
+  accounts,
+  alpha,
+  workerThreads,
+}: {
+  connectorSystem: string;
+  seconds: number;
+  concurrency: number;
+  accounts: number;
+  alpha: number;
+  workerThreads?: number;
+}): Promise<RunResult> {
+  const W = Math.min(workerThreads ?? os.cpus().length, concurrency);
+
+  console.log(
+    `[multi-threaded] ${connectorSystem}: ${seconds}s, ${concurrency} total workers across ${W} threads, ${accounts} accounts, alpha=${alpha}`,
+  );
+
+  // Precompute Zipf pairs into SharedArrayBuffers
+  const precomputedPairsRaw = Number(
+    process.env.BENCH_PRECOMPUTED_TRANSFER_PAIRS ?? DEFAULT_PRECOMPUTED_TRANSFER_PAIRS,
+  );
+  const precomputedPairs = Number.isFinite(precomputedPairsRaw)
+    ? Math.max(1, Math.floor(precomputedPairsRaw))
+    : DEFAULT_PRECOMPUTED_TRANSFER_PAIRS;
+
+  console.log(`[multi-threaded] precomputing ${precomputedPairs} Zipf transfer pairs...`);
+  const precomputeStart = performance.now();
+  const transferPairs = precomputeZipfTransferPairsShared(accounts, alpha, precomputedPairs);
+  const precomputeElapsedMs = performance.now() - precomputeStart;
+  console.log(
+    `[multi-threaded] precomputed ${transferPairs.count} pairs in ${(precomputeElapsedMs / 1000).toFixed(2)}s`,
+  );
+
+  // Read env config for pipelined mode and inflight limits
+  const pipelined = process.env.BENCH_PIPELINED === '1';
+  const maxInflightEnv = process.env.MAX_INFLIGHT_PER_WORKER;
+  const maxInflightPerWorker =
+    maxInflightEnv === '0' ? Infinity : Number(maxInflightEnv ?? '8');
+
+  // Divide concurrency across threads
+  const baseConcurrency = Math.floor(concurrency / W);
+  const remainder = concurrency % W;
+
+  // Resolve the worker script path
+  const workerPath = fileURLToPath(new URL('./runner_worker.ts', import.meta.url));
+
+  const start = performance.now();
+
+  // Spawn W worker threads
+  const workerPromises: Promise<WorkerResult>[] = [];
+  let pairOffset = 0;
+
+  for (let i = 0; i < W; i++) {
+    const threadConcurrency = baseConcurrency + (i < remainder ? 1 : 0);
+    const pairsForThisThread = Math.max(
+      1,
+      Math.floor(transferPairs.count / W) + (i < (transferPairs.count % W) ? 1 : 0),
+    );
+
+    const input: WorkerInput = {
+      connectorSystem,
+      seconds,
+      concurrency: threadConcurrency,
+      workerThreadIndex: i,
+      totalWorkerThreads: W,
+      accounts,
+      alpha,
+      pairCount: transferPairs.count,
+      fromBuffer: transferPairs.fromBuffer,
+      toBuffer: transferPairs.toBuffer,
+      pairStartOffset: pairOffset,
+      pairsForThisThread,
+      pipelined,
+      maxInflightPerWorker,
+      opTimeoutMs: OP_TIMEOUT_MS,
+      minOpTimeoutMs: MIN_OP_TIMEOUT_MS,
+      tailSlackMs: TAIL_SLACK_MS,
+    };
+
+    pairOffset += pairsForThisThread;
+
+    const promise = new Promise<WorkerResult>((resolve, reject) => {
+      // tsx workaround: eval:true always uses CJS context (require is available) regardless of package.json type:module.
+      // Register tsx ESM loader, then dynamically import the TS worker script.
+      const escapedPath = workerPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      const workerCode = [
+        `const { register } = require('tsx/esm/api');`,
+        `register();`,
+        `import('${escapedPath}');`,
+      ].join('\n');
+      const worker = new Worker(workerCode, {
+        eval: true,
+        workerData: input,
+      });
+
+      let settled = false;
+      worker.on('message', (result: WorkerResult) => {
+        if (!settled) { settled = true; resolve(result); }
+      });
+      worker.on('error', (err: Error) => {
+        if (!settled) { settled = true; reject(err); }
+      });
+      worker.on('exit', (code: number) => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Worker thread ${i} exited with code ${code} without sending results`));
+        }
+      });
+    });
+
+    workerPromises.push(promise);
+  }
+
+  console.log(`[multi-threaded] ${W} worker threads spawned, waiting for results...`);
+
+  // Wait for all workers to complete
+  const results = await Promise.all(workerPromises);
+
+  const elapsed = (performance.now() - start) / 1000;
+
+  // Aggregate results
+  let totalCompletedWithinWindow = 0;
+  let totalCompleted = 0;
+  let totalCollisionOps = 0;
+  let totalCollisionCount = 0;
+
+  // Merge HDR histograms
+  const mergedHist = hdr.build({
+    lowestDiscernibleValue: 1,
+    highestTrackableValue: 10_000_000_000,
+    numberOfSignificantValueDigits: 3,
+  });
+
+  for (const r of results) {
+    totalCompletedWithinWindow += r.completedWithinWindow;
+    totalCompleted += r.completedTotal;
+    totalCollisionOps += r.collisionTotal;
+    totalCollisionCount += r.collisionCount;
+
+    if (r.histogramBase64) {
+      const decoded = hdr.decodeFromCompressedBase64(r.histogramBase64);
+      mergedHist.add(decoded);
+    }
+  }
+
+  const q = (p: number) => mergedHist.getValueAtPercentile(p) / 1000;
+  const collisionRate = totalCollisionOps === 0 ? 0 : totalCollisionCount / totalCollisionOps;
+
+  console.log(
+    `[multi-threaded] completed within window = ${totalCompletedWithinWindow}, total = ${totalCompleted}, elapsed = ${elapsed.toFixed(2)}s`,
+  );
+
+  return {
+    tps: totalCompletedWithinWindow / seconds,
+    samples: totalCompletedWithinWindow,
+    committed_txns: null,
+    p50_ms: q(50),
+    p95_ms: q(95),
+    p99_ms: q(99),
+    collision_ops: totalCollisionOps,
+    collision_count: totalCollisionCount,
+    collision_rate: collisionRate,
   };
 }

@@ -4,7 +4,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { CONNECTORS } from './connectors';
-import { runOne } from './core/runner';
+import { runOne, runOneMultiThreaded } from './core/runner';
 import { initConvex } from './init/init_convex';
 import { sh } from './init/utils';
 import * as fs from 'fs';
@@ -188,6 +188,16 @@ const serviceConfigs: Record<string, ServiceConfig> = {
     healthCheck: () => ping(4001),
     startCmd: 'bun run bun/bun-server.ts',
   },
+  sqlite_direct: {
+    name: 'SQLite Direct',
+    healthCheck: async () => true,
+    startCmd: 'N/A (in-process)',
+  },
+  sqlite_direct_memory: {
+    name: 'SQLite Direct Memory',
+    healthCheck: async () => true,
+    startCmd: 'N/A (in-process)',
+  },
 };
 
 async function checkService(system: string): Promise<boolean> {
@@ -296,18 +306,34 @@ async function runBenchmarkOther(system: string): Promise<BenchResult | null> {
     return null;
   }
 
-  const connector = connectorFactory();
-  const testMod = await import(`./tests/test-1/${system}.ts`);
-  const scenario = testMod.default.run;
+  // BENCH_WORKER_THREADS > 1: multi-threaded mode
+  // BENCH_WORKER_THREADS=1 or unset/0: single-threaded (original behavior)
+  const workerThreadsEnv = Number(process.env.BENCH_WORKER_THREADS || '0');
+  const useMultiThreaded = workerThreadsEnv > 1;
 
-  const result = await runOne({
-    connector,
-    scenario,
-    seconds,
-    concurrency,
-    accounts,
-    alpha,
-  });
+  let result;
+  if (useMultiThreaded) {
+    result = await runOneMultiThreaded({
+      connectorSystem: system,
+      seconds,
+      concurrency,
+      accounts,
+      alpha,
+      workerThreads: workerThreadsEnv,
+    });
+  } else {
+    const connector = connectorFactory();
+    const testMod = await import(`./tests/test-1/${system}.ts`);
+    const scenario = testMod.default.run;
+    result = await runOne({
+      connector,
+      scenario,
+      seconds,
+      concurrency,
+      accounts,
+      alpha,
+    });
+  }
 
   return {
     system,

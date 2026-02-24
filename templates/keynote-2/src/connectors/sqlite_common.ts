@@ -46,16 +46,19 @@ export function applySqlitePragmas(
       db.pragma('synchronous = MEMORY');
       db.pragma('temp_store = MEMORY');
       db.pragma('cache_size = -64000');
+      db.pragma('busy_timeout = 5000');
       break;
     case 'realistic_fast':
       db.pragma('journal_mode = WAL');
       db.pragma('synchronous = NORMAL');
       db.pragma('temp_store = MEMORY');
       db.pragma('cache_size = -64000');
+      db.pragma('busy_timeout = 5000');
       break;
     case 'realistic':
       db.pragma('journal_mode = WAL');
       db.pragma('synchronous = FULL');
+      db.pragma('busy_timeout = 5000');
       break;
     case 'default':
       // leave engine defaults

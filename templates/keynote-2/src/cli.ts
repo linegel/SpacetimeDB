@@ -1,7 +1,7 @@
 ﻿import 'dotenv/config';
 import { readdir, mkdir, writeFile } from 'node:fs/promises';
 import { CONNECTORS } from './connectors';
-import { runOne } from './core/runner';
+import { runOne, runOneMultiThreaded } from './core/runner';
 import type { TestCaseModule } from './tests/types';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -35,7 +35,8 @@ let seconds = 1,
     endConc: number;
     step: number;
     alpha: number;
-  } | null = null;
+  } | null = null,
+  workerThreadsArg: number | undefined = Number(process.env.BENCH_WORKER_THREADS || '0') || undefined;
 
 for (let i = 0; i < posArgs.length; ) {
   const arg = posArgs[i];
@@ -92,6 +93,16 @@ for (let i = 0; i < posArgs.length; ) {
 
       i += 5;
       break;
+    case 'worker-threads': {
+      const parsed = Number(val);
+      if (isNaN(parsed) || parsed < 0) {
+        console.error(`Invalid --worker-threads value: ${val}`);
+        process.exit(1);
+      }
+      workerThreadsArg = parsed;
+      i += 2;
+      break;
+    }
   }
 }
 
@@ -237,6 +248,9 @@ const testDirPath = fileURLToPath(testDirUrl);
 
     const tester = new BenchmarkTester(config);
 
+    // Use multi-threaded runner when --worker-threads is set (and != 1)
+    const useMultiThreaded = workerThreadsArg !== undefined && workerThreadsArg !== 1;
+
     if (contentionTests) {
       res = await tester.contentionTests(
         contentionTests.startAlpha,
@@ -251,6 +265,15 @@ const testDirPath = fileURLToPath(testDirUrl);
         concurrencyTests.step,
         concurrencyTests.alpha,
       );
+    } else if (useMultiThreaded) {
+      res = await runOneMultiThreaded({
+        connectorSystem: tc.system,
+        seconds,
+        concurrency,
+        accounts,
+        alpha,
+        workerThreads: workerThreadsArg,
+      });
     } else {
       res = await runOne({
         connector,

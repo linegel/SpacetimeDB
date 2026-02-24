@@ -6,6 +6,8 @@ import cockroach_rpc from './rpc/cockroach_rpc.ts';
 import sqlite_rpc from './rpc/sqlite_rpc.ts';
 import supabase_rpc from './rpc/supabase_rpc.ts';
 import planetscale_pg_rpc from './rpc/planetscale_pg_rpc.ts';
+import sqlite_direct from './sqlite_direct.ts';
+import sqlite_direct_memory from './sqlite_direct_memory.ts';
 
 export const CONNECTORS = {
   convex,
@@ -16,5 +18,7 @@ export const CONNECTORS = {
   sqlite_rpc,
   supabase_rpc,
   planetscale_pg_rpc,
+  sqlite_direct,
+  sqlite_direct_memory,
 };
 export type ConnectorKey = keyof typeof CONNECTORS;
